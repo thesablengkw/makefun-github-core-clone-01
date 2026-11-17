@@ -1,39 +1,80 @@
-import { spawn, type ChildProcess } from "node:child_process";
+// Launcher: the platform runs `node /bot/main.ts`; this file starts the
+// vendored static forge binary next to it and forwards the exit code.
+//
+// Mode-proofing (S3): the forge binary can land in the pod without its
+// executable bit (a web upload once recorded it as mode 100644), which
+// made the spawn fail with EACCES and the server never started. Before
+// spawning, restore the bit in place; if the file is still not
+// executable afterwards (e.g. a read-only directory), run a verified
+// executable copy from a fresh writable temp directory instead.
+import {
+  spawn,
+  type ChildProcess,
+} from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { accessSync, constants } from "node:fs";
-
-// Thin launcher for the vendored forge binary (statically linked Linux amd64 C,
-// no runtime dependencies). Lifecycle contract with the harness: the binary binds an
-// ephemeral port, POSTs it to $MAKEFUN_ENV_URL/register, serves until GET /done
-// answers {"done": true}, then exits 0. This launcher only forwards signals and the
-// exit code; it never interprets traffic.
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  copyFileSync,
+  mkdtempSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 
 const dir = dirname(fileURLToPath(import.meta.url));
-const bin = join(dir, "forge");
 
-// Fail fast with an actionable message instead of a bare spawn ENOENT when the
-// binary is missing or not executable (e.g. a partial checkout).
-try {
-  accessSync(bin, constants.X_OK);
-} catch {
-  console.error(`forge binary missing or not executable: ${bin}`);
-  process.exit(1);
+function isExecutable(path: string): boolean {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-const child: ChildProcess = spawn(bin, [], { stdio: "inherit" });
+function resolveForgePath(): string {
+  const forgePath = join(dir, "forge");
+  try {
+    chmodSync(forgePath, 0o755);
+  } catch {
+    // In-place chmod failed (e.g. read-only directory): fall through to
+    // the temp-copy path below.
+  }
+  if (isExecutable(forgePath)) {
+    return forgePath;
+  }
+  const copyDir = mkdtempSync(join(tmpdir(), "forge-"));
+  const copyPath = join(copyDir, "forge");
+  copyFileSync(forgePath, copyPath);
+  chmodSync(copyPath, 0o755);
+  if (!isExecutable(copyPath)) {
+    throw new Error(`forge copy at ${copyPath} is not executable`);
+  }
+  return copyPath;
+}
 
-const forward = (signal: NodeJS.Signals): void => {
-  if (!child.kill(signal)) process.exit(1);
-};
-process.on("SIGINT", () => forward("SIGINT"));
-process.on("SIGTERM", () => forward("SIGTERM"));
-
+let forgeBin: string;
+try {
+  forgeBin = resolveForgePath();
+} catch (err) {
+  // Same failure surface as a spawn error: message on stderr, exit 1.
+  console.error(
+    `failed to start forge: ${err instanceof Error ? err.message : String(err)}`,
+  );
+  process.exit(1);
+}
+const child: ChildProcess = spawn(forgeBin, process.argv.slice(2), {
+  stdio: "inherit",
+  env: process.env,
+});
 child.on("error", (err) => {
-  console.error(`failed to start forge binary: ${err.message}`);
+  console.error(`failed to start forge: ${err.message}`);
   process.exit(1);
 });
-child.on("exit", (code, signal) => {
-  if (signal) process.kill(process.pid, signal);
-  else process.exit(code ?? 1);
-});
+// Forward termination signals so the forge shuts down cleanly instead of
+// being left orphaned when the platform stops this launcher.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => child.kill(signal));
+}
+child.on("exit", (code) => process.exit(code ?? 1));

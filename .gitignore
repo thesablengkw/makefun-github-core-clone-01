@@ -1,7 +1,3 @@
-# Local build artifacts: the Muse usage rows and the submission bundle live
-# next to the repo, never in it (they would add counted lines with no
-# agent evidence behind them). The entry itself is self-contained: the
-# launcher (main.ts), the vendored binary (forge), LICENSE, README.md and
-# .makefun/owner.json are the only files a submission needs.
-muse-usage.jsonl
-bundle.tar.gz
+# Go test binaries and editor/OS artefacts.
+*.test
+.DS_Store
